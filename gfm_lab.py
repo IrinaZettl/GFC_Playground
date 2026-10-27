@@ -20,12 +20,16 @@ read them.  The notebook only needs `run_case()` and `plot_results()`.
 
 import logging
 
+# Do not pass ANDES messages on to the root logger: Google Colab attaches its own
+# handler there, which would otherwise print every INFO/WARNING message.
+# (Set before `import andes`, which already logs during import.)
+logging.getLogger('andes').propagate = False
+
 import andes
 import matplotlib.pyplot as plt
 import numpy as np
 
 andes.config_logger(stream_level=logging.ERROR)
-logging.getLogger("andes").propagate = False
 
 F_NOM = 50.0     # Hz
 S_BASE = 100.0   # MVA, system base
