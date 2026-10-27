@@ -1,17 +1,23 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "gfm_lab"
+name = "gfm-lab"
 version = "0.1.0"
-description = "Helper functions for my notebook"
-requires-python = ">=3.9"
+description = "Helper module for the ANDES lab 'Grid-following vs. grid-forming inverters'"
+readme = "README.md"
+requires-python = ">=3.11"
 dependencies = [
+    "andes==2.0.0",
+    "ipywidgets>=7.7",   # >=7.7 so the preinstalled version on Google Colab is kept
+    "matplotlib",
     "numpy",
-    "andes",
-    "matplotlib"
+    "pandas",
 ]
+
+[project.optional-dependencies]
+local = ["jupyterlab", "ipykernel"]
 
 [tool.setuptools]
 py-modules = ["gfm_lab"]
