@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 dependencies = [
     "numpy",
     "logging",
-    "andes"
+    "andes",
     "matplotlib.pyplot"
 ]
 
