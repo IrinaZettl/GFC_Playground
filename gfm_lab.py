@@ -30,6 +30,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 andes.config_logger(stream_level=logging.ERROR)
+logging.disable(logging.INFO)
+logging.disable(logging.DEBUG)
 
 F_NOM = 50.0     # Hz
 S_BASE = 100.0   # MVA, system base
