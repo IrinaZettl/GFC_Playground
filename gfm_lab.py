@@ -6,10 +6,12 @@ The test system is the WSCC / IEEE 9-bus system with TWO generation units:
     * G1  (bus 1): synchronous generator (GENROU + IEEEX1 exciter + TGOV1 governor)
     * IBR (bus 2): inverter-based resource, either
         - grid-following (GFL):  REGCA1 + REECA1 + REPCA1  (WECC generic models)
-        - grid-forming  (GFM):  REGF1 (droop) or REGF2 (virtual synchronous machine)
+        - grid-forming  (GFM):  REGF1 (droop) or REGF2 (virtual synchronous machine),
+          extended by a current limiter and an optional integral frequency
+          controller -> REGF1Lab / REGF2Lab (defined below)
 
-Optionally, a discrete secondary frequency controller (AGC, integral control)
-shifts the power set-points of both units to bring the frequency back to 60 Hz.
+With the integral frequency control switched on, the GFM inverter shifts its own
+power set-point until the frequency is back at 50 Hz.
 
 Bus 3 (originally the third machine) is kept as an empty node so the familiar
 9-bus topology is preserved.
@@ -19,6 +21,8 @@ read them.  The notebook only needs `run_case()` and `plot_results()`.
 """
 
 import logging
+import sys
+import types
 
 # Do not pass ANDES messages on to the root logger: Google Colab attaches its own
 # handler there, which would otherwise print every INFO/WARNING message.
@@ -28,10 +32,15 @@ logging.getLogger('andes').propagate = False
 import andes
 import matplotlib.pyplot as plt
 import numpy as np
+from andes.core import Algeb, ConstService, NumParam, State
+from andes.core.block import IntegratorAntiWindup
+from andes.core.common import dummify
+from andes.core.discrete import HardLimiter
+from andes.models.renewable.regf1 import (REGF1Data, REGF1Model, REGF1Primary,
+                                          REGFInnerPIModel)
+from andes.models.renewable.regf2 import REGF2Data, REGF2Primary
 
 andes.config_logger(stream_level=logging.ERROR)
-logging.disable(logging.INFO)
-logging.disable(logging.DEBUG)
 
 F_NOM = 50.0     # Hz
 S_BASE = 100.0   # MVA, system base
@@ -74,14 +83,10 @@ GFM_DEFAULTS = dict(
     KIi=20.0,           # current controller integral gain
     Te=0.005,           # converter output voltage time constant [s]
     Pmax=1.2,           # active power limit [p.u. on inverter base]
-)
-
-AGC_DEFAULTS = dict(
-    enabled=False,      # switch secondary control (AGC) on/off
-    T_sec=20.0,         # integration time constant of the AGC [s]
-    share_sg=0.5,       # participation factor of the synchronous generator (rest: inverter)
-    dt=0.5,             # AGC cycle time [s] (real AGCs: 1-4 s)
-    bus=5,              # bus where the frequency is measured
+    current_limit=True, # limit the converter current magnitude to Imax
+    Imax=1.2,           # current limit |I| <= Imax [p.u. on inverter base]
+    freq_integral=False,  # integral frequency control in the inverter (restores 50 Hz)
+    T_I=10.0,           # time constant of the integral frequency control [s]
 )
 
 DISTURBANCES = {
@@ -91,6 +96,180 @@ DISTURBANCES = {
     'Line trip 5-7': dict(kind='line', line='Line_2'),
     'Trip of sync. generator G1': dict(kind='gen', dev='GENROU_1'),
 }
+
+
+# --------------------------------------------------------------------------
+# Grid-forming models of the lab (REGF1Lab, REGF2Lab)
+# --------------------------------------------------------------------------
+#
+# The ANDES models REGF1 (droop) and REGF2 (VSM) are extended by
+#   1) a current limiter and
+#   2) an integral frequency controller.
+#
+# 1) Current limitation
+# The ANDES models REGF1 / REGF2 pass the outputs of the voltage controllers
+# directly to the current controllers as references, so the inverter current
+# is unlimited. A real converter must protect its semiconductors, so the models
+# below add a circular current limiter between the two loops:
+#
+#     I_ul  = output of the voltage PI controllers (d and q axis)
+#     I_ref = I_ul                     if |I_ul| <= Imax
+#           = I_ul * Imax / |I_ul|     otherwise   (direction is kept)
+#
+# While the limit is active the voltage controllers would wind up, so their
+# integrators track the limited reference (back-calculation anti-windup):
+#
+#     dx/dt = KIv * e + KIv / KPv * (I_ref - I_ul)
+#
+# In current limitation the inverter no longer behaves like a voltage source
+# behind x_f but like a current source - it can then lose synchronism.
+#
+# 2) Integral frequency control
+# Droop control alone leaves a permanent frequency deviation. The integral
+# controller integrates the inverter's own frequency deviation into an extra
+# power set-point P_sec, which is added to P_ref in the droop / VSM equation:
+#
+#     dP_sec/dt = -K_I * (omega - omega_0) / omega_0,    K_I = 1 / (m_p * T_I)
+#
+# In steady state dP_sec/dt = 0, so the frequency is exactly 50 Hz again.
+# P_sec is limited so that P_ref + P_sec stays within [Pmin, Pmax] (anti-windup).
+# K_I = 0 switches the integral control off.
+
+class _LabData:
+    def __init__(self):
+        self.Imax = NumParam(default=999.0, tex_name='I_{max}', unit='p.u.',
+                             info='max. converter current magnitude',
+                             non_negative=True,
+                             power=True,   # p.u. on device base -> system base
+                             )
+        self.KI = NumParam(default=0.0, tex_name='K_I', non_negative=True,
+                           info='gain of the integral frequency control (0 = off)')
+
+
+class _FrequencyIntegral:
+    """Integral frequency controller: extra power set-point Psec_y."""
+
+    def __init__(self):
+        self.Psecmax = ConstService(v_str='Pmax - Pref', tex_name='P_{sec,max}')
+        self.Psecmin = ConstService(v_str='Pmin - Pref', tex_name='P_{sec,min}')
+        self.Psec = IntegratorAntiWindup(u='- KI * dw_y / w0', T=1.0, K=1.0, y0=0.0,
+                                         lower=self.Psecmin, upper=self.Psecmax,
+                                         tex_name='P_{sec}',
+                                         info='power set-point of the integral frequency control')
+
+
+class _CurrentLimitedVoltageControl:
+    """Voltage PI controllers + circular current limiter (replaces REGFOuterPIModel)."""
+
+    def __init__(self):
+        self.Kaw = ConstService(v_str='KIv / KPv', tex_name='K_{aw}',
+                                info='anti-windup (back-calculation) gain')
+        # unlimited outputs of the voltage controllers: PI with anti-windup
+        self.xvd = State(info='d-axis voltage controller integrator', tex_name='x_{vd}',
+                         v_str='Id0', e_str='KIv * (vref2 - vd) + Kaw * (Idref - Idul)')
+        self.xvq = State(info='q-axis voltage controller integrator', tex_name='x_{vq}',
+                         v_str='Iq0', e_str='- KIv * vq + Kaw * (Iqref - Iqul)')
+        self.Idul = Algeb(info='unlimited d-axis current reference', tex_name='I_{d,ul}',
+                          v_str='Id0', e_str='KPv * (vref2 - vd) + xvd - Idul')
+        self.Iqul = Algeb(info='unlimited q-axis current reference', tex_name='I_{q,ul}',
+                          v_str='Iq0', e_str='- KPv * vq + xvq - Iqul')
+        # current magnitude and limiter
+        self.Imag = Algeb(info='magnitude of the unlimited current reference', tex_name='|I_{ul}|',
+                          v_str='sqrt(Id0**2 + Iq0**2)',
+                          e_str='sqrt(Idul**2 + Iqul**2) - Imag')
+        self.Ilim = HardLimiter(u=self.Imag, lower=0.0, upper=self.Imax, no_lower=True,
+                                allow_adjust=False, tex_name='I_{lim}')
+        # limited current references (scaled, direction kept)
+        self.Idref = Algeb(info='limited d-axis current reference', tex_name='I_{dref}',
+                           v_str='Id0',
+                           e_str='Idul * (Ilim_zi + Ilim_zu * Imax / (Imag + 1e-6)) - Idref')
+        self.Iqref = Algeb(info='limited q-axis current reference', tex_name='I_{qref}',
+                           v_str='Iq0',
+                           e_str='Iqul * (Ilim_zi + Ilim_zu * Imax / (Imag + 1e-6)) - Iqref')
+
+
+def _rewire(block, u):
+    """Give an existing ANDES block a new input and rebuild its equations."""
+    block.u = dummify(u)
+    block.define()
+
+
+def _rewire_current_controllers(model):
+    """Feed the current controllers with the limited references."""
+    _rewire(model.PIId, 'Idref - Id')
+    _rewire(model.PIIq, 'Iqref - Iq')
+
+
+class REGF1Lab(REGF1Data, _LabData, REGF1Model, REGF1Primary, _FrequencyIntegral,
+               _CurrentLimitedVoltageControl, REGFInnerPIModel):
+    """REGF1 (droop GFM) with current limiter and integral frequency control."""
+
+    def __init__(self, system, config):
+        REGF1Data.__init__(self)
+        _LabData.__init__(self)
+        REGF1Model.__init__(self, system, config)
+        REGF1Primary.__init__(self)
+        _FrequencyIntegral.__init__(self)
+        _CurrentLimitedVoltageControl.__init__(self)
+        REGFInnerPIModel.__init__(self)
+        _rewire_current_controllers(self)
+        # droop: omega - omega_0 = m_p * (P_ref + P_sec - P)
+        _rewire(self.dw, 'w0 * wdrp * (PIplim_y + Psec_y - Psen_y)')
+
+
+class REGF2Lab(REGF2Data, _LabData, REGF1Model, REGF2Primary, _FrequencyIntegral,
+               _CurrentLimitedVoltageControl, REGFInnerPIModel):
+    """REGF2 (VSM GFM) with current limiter and integral frequency control."""
+
+    def __init__(self, system, config):
+        REGF2Data.__init__(self)
+        _LabData.__init__(self)
+        REGF1Model.__init__(self, system, config)
+        REGF2Primary.__init__(self)
+        _FrequencyIntegral.__init__(self)
+        _CurrentLimitedVoltageControl.__init__(self)
+        REGFInnerPIModel.__init__(self)
+        _rewire_current_controllers(self)
+        # swing equation: P_ref is replaced by P_ref + P_sec
+        _rewire(self.INTw, '(plldw * dd * wdrp) + wref + wdrp * (PIplim_y + Psec_y - Psen_y)'
+                           ' - INTw_y')
+
+
+def _register_models():
+    """
+    Make the models known to ANDES: ANDES imports every model listed in
+    `andes.models.file_classes` from a module `andes.models.<name>`.
+    """
+    mod = types.ModuleType('andes.models.gfm_lab_models')
+    mod.REGF1Lab, mod.REGF2Lab = REGF1Lab, REGF2Lab
+    sys.modules[mod.__name__] = mod
+    entry = ('gfm_lab_models', ['REGF1Lab', 'REGF2Lab'])
+    fc = andes.models.file_classes
+    fc[:] = [e for e in fc if e[0] != entry[0]] + [entry]   # safe on module reload
+
+
+_register_models()
+
+
+def _new_system():
+    """
+    andes.System() with the lab models. ANDES turns the model equations into
+    Python code once and caches it in ~/.andes/pycode. For the two new models
+    this happens on first use (takes ~1 min); it runs in this process
+    because ANDES' parallel code generation cannot see the new models.
+    """
+    ss = andes.System(no_undill=True)
+    ss.undill(autogen_stale=False)
+    stale = list(ss.codegen._find_stale_models())
+    if stale:
+        print(f'Generating code for {", ".join(stale)} (only once, takes ~1 min) ...')
+        ss.prepare(quick=True, incremental=True, models=stale, nomp=True)
+        # ANDES only reloads the code files it had already imported. Forget the
+        # loaded package so later System() calls import it again from disk,
+        # including the newly generated files.
+        for name in [n for n in sys.modules if n == 'pycode' or n.startswith('pycode.')]:
+            del sys.modules[name]
+    return ss
 
 
 # --------------------------------------------------------------------------
@@ -166,7 +345,7 @@ def _add_gfl(ss, p):
     ss.add('BusFreq', dict(idx='BusFreq_IBR', bus=2, Tf=p['Tf_pll'], Tw=0.02, fn=F_NOM))
     ss.add('REPCA1', dict(idx='REPCA1_1', ree='REECA1_1', line='Trafo_2',
                           busr=2, busf='BusFreq_IBR',
-                          # Fflag=1 keeps the plant P control active (needed for the AGC);
+                          # Fflag=1 keeps the plant P control active;
                           # "no frequency support" is realised with zero droop gains
                           VCFlag=1, RefFlag=1, Fflag=1, PLflag=1,
                           Tfltr=p['Tfltr'], Kp=p['Kp_v'], Ki=p['Ki_v'],
@@ -197,11 +376,15 @@ def _add_gfm(ss, p):
                 Pmax=p['Pmax'], Pmin=0.0, Qmax=1.0, Qmin=-1.0,
                 # The P/Q-limit PI loops of the ANDES implementation would slowly
                 # shift the droop set-points; switch them off -> clean droop.
-                KPplim=0.0, KIplim=0.0, KPqlim=0.0, KIqlim=0.0)
+                KPplim=0.0, KIplim=0.0, KPqlim=0.0, KIqlim=0.0,
+                # current limit, p.u. on inverter base (999 = practically unlimited)
+                Imax=p['Imax'] if p['current_limit'] else 999.0,
+                # integral frequency control: K_I = 1 / (m_p * T_I), m_p on system base
+                KI=1.0 / (p['droop'] * S_BASE / S_IBR * p['T_I']) if p['freq_integral'] else 0.0)
     if p['variant'] == 'vsm':
-        ss.add('REGF2', dict(data, mf=2 * p['H_vsm'] * S_IBR / S_BASE, dd=p['D_vsm']))
+        ss.add('REGF2Lab', dict(data, mf=2 * p['H_vsm'] * S_IBR / S_BASE, dd=p['D_vsm']))
     else:
-        ss.add('REGF1', data)
+        ss.add('REGF1Lab', data)
 
 
 def _add_disturbance(ss, dist, t_event):
@@ -222,7 +405,7 @@ def _add_disturbance(ss, dist, t_event):
 def build_system(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
                  p_ibr=1.63, t_event=1.0):
     """Create (but do not run) the ANDES system."""
-    ss = andes.System()
+    ss = _new_system()
     _add_network(ss, p_ibr)
     _add_sync_machine(ss)
 
@@ -249,17 +432,14 @@ def build_system(control='GFM', params=None, disturbance='Load step +50 MW (bus 
 
 
 def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
-             p_ibr=1.63, t_end=20.0, t_event=1.0, agc=None, verbose=False,
+             p_ibr=1.63, t_end=20.0, t_event=1.0, verbose=False,
              h_fine=1 / 120, h_coarse=None, t_fine=5.0):
     """
     Build the system, solve the power flow and run the RMS simulation.
 
-    agc : None/False (no secondary control), True (AGC with default settings)
-          or a dict overriding AGC_DEFAULTS, e.g. {'T_sec': 20, 'share_sg': 1.0}
-
     Time step: h_fine until t_fine seconds after the event (fast inverter and
-    network dynamics), then h_coarse (slow governor / AGC dynamics). This keeps
-    long simulations with secondary control reasonably fast. h_coarse=None picks
+    network dynamics), then h_coarse (slow governor / integral control dynamics).
+    This keeps long simulations reasonably fast. h_coarse=None picks
     0.1 s for GFM and 1/30 s for GFL (the GFL models converge poorly with larger steps).
     """
     if h_coarse is None:
@@ -268,18 +448,11 @@ def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
     ss.PFlow.run()
     if not ss.PFlow.converged:
         raise RuntimeError('Power flow did not converge.')
+    if control.upper() == 'GFM':
+        _check_initial_current(ss, {**GFM_DEFAULTS, **(params or {})})
     ss.TDS.config.no_tqdm = True
     ss._lab_control = control.upper()
     ss._lab_t_event = t_event
-    ss._lab_agc = None
-
-    if agc is True:
-        agc = {}
-    if isinstance(agc, dict):
-        agc = {**AGC_DEFAULTS, 'enabled': True, **agc}
-    if agc and agc['enabled']:
-        defaults = GFL_DEFAULTS if ss._lab_control == 'GFL' else GFM_DEFAULTS
-        _setup_agc(ss, {**defaults, **(params or {})}, agc)
 
     # stage 1: fine time step around the disturbance
     ss.TDS.config.tstep = h_fine
@@ -290,90 +463,20 @@ def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
         ss.TDS.config.tstep = h_coarse
         ss.TDS.config.tf = t_end
         ss.TDS.run()
-    if ss._lab_agc is not None:
-        ss._lab_agc = {k: (np.array(v) if isinstance(v, list) else v)
-                       for k, v in ss._lab_agc.items()}
 
     if verbose:
         print(f"TDS finished OK: {not ss.TDS.busted}")
     return ss
 
 
-# --------------------------------------------------------------------------
-# Secondary frequency control (AGC)
-# --------------------------------------------------------------------------
-#
-# Single control area, so the area control error is ACE = beta * delta_f.
-# The AGC is a discrete integral controller that runs every `dt` seconds:
-#
-#     dP_sec[k+1] = dP_sec[k] - beta / T_sec * delta_f[k] * dt
-#
-# beta (the "frequency bias", MW per p.u. frequency) is the sum of all droop
-# gains. With this choice the frequency error decays roughly with T_sec.
-# dP_sec is split between the units according to the participation factors.
-
-def _frequency_bias(ss, p):
-    """Sum of the droop gains S_i / R_i in system p.u. (MW / S_BASE per p.u. f)."""
-    beta = (S_SG / S_BASE) / R_GOV                         # governor droop
-    if ss._lab_control == 'GFM':
-        beta += (S_IBR / S_BASE) / p['droop']
-    elif p['freq_support']:
-        beta += (S_IBR / S_BASE) / p['droop']
-    return beta
-
-
-def _set_agc_setpoints(ss, dp_sg, dp_ibr, applied):
-    """
-    Shift the power set-points by dp_sg / dp_ibr (system p.u., cumulative values).
-    `applied` stores what was already applied to the inverter state.
-    """
-    # synchronous generator: TGOV1 adds paux *before* its gain 1/R  ->  paux = dP * R
-    ss.TGOV1.paux0.v[:] = dp_sg / ss.TGOV1.gain.v[0] if ss.TGOV1.gain.v[0] else 0.0
-
-    if ss._lab_control == 'GFL':
-        # plant controller power reference
-        ss.REPCA1.Pline0.v[:] = applied['Pline0'] + dp_ibr
-    else:
-        # REGF1/REGF2: the active-power set-point is the integrator state of the
-        # (disabled) P-limit PI controller -> shift it directly
-        m = _ibr_model(ss)
-        ss.dae.x[m.PIplim_xi.a] += dp_ibr - applied['ibr']
-        applied['ibr'] = dp_ibr
-
-
-def _setup_agc(ss, p, agc):
-    """
-    Attach the AGC to the simulation.
-
-    ANDES calls `ss.TDS.callpert(t, system)` before every integration step;
-    the AGC acts there whenever one AGC cycle (`dt`) has elapsed.
-    """
-    beta = _frequency_bias(ss, p)
-    st = dict(dp_tot=0.0, t_last=0.0, applied={'ibr': 0.0}, f_addr=None)
-    log = dict(t=[0.0], dp_sg=[0.0], dp_ibr=[0.0], beta=beta * S_BASE, **agc)
-    ss._lab_agc = log
-
-    def agc_step(t, system):
-        t = float(t)                                # ANDES passes dae.t (changes in place)
-        if st['f_addr'] is None:                    # first call: after initialisation
-            bf = list(system.BusFreq.bus.v).index(agc['bus'])
-            st['f_addr'] = system.BusFreq.f.a[bf]
-            if system._lab_control == 'GFL':
-                st['applied']['Pline0'] = system.REPCA1.Pline0.v.copy()
-        if t - st['t_last'] < agc['dt'] - 1e-9:
-            return
-        # 1) measure frequency, 2) integrate, 3) distribute to the units
-        df = system.dae.y[st['f_addr']] - 1.0
-        st['dp_tot'] -= beta / agc['T_sec'] * df * (t - st['t_last'])
-        st['t_last'] = t
-        share_sg = agc['share_sg'] if system.GENROU.u.v[0] > 0.5 else 0.0
-        dp_sg, dp_ibr = share_sg * st['dp_tot'], (1 - share_sg) * st['dp_tot']
-        _set_agc_setpoints(system, dp_sg, dp_ibr, st['applied'])
-        log['t'].append(t)
-        log['dp_sg'].append(dp_sg * S_BASE)
-        log['dp_ibr'].append(dp_ibr * S_BASE)
-
-    ss.TDS.callpert = agc_step
+def _check_initial_current(ss, p):
+    """The power-flow operating point must not already exceed the current limit."""
+    if not p['current_limit']:
+        return
+    i0 = np.hypot(ss.PV.p.v[0], ss.PV.q.v[0]) * S_BASE / S_IBR / ss.Bus.v.v[1]
+    if i0 > p['Imax']:
+        raise ValueError(f'The initial inverter current ({i0:.2f} p.u.) exceeds the current '
+                         f'limit Imax = {p["Imax"]:.2f} p.u. Reduce the dispatch or raise Imax.')
 
 
 # --------------------------------------------------------------------------
@@ -417,7 +520,7 @@ def draw_grid(ax=None):
     ax.set_ylim(-0.8, 4.0)
     ax.set_aspect('equal')
     ax.axis('off')
-    ax.set_title('Modified IEEE 9-bus test system (60 Hz)')
+    ax.set_title(f'Modified IEEE 9-bus test system ({F_NOM:.0f} Hz)')
     return ax
 
 
@@ -427,7 +530,7 @@ def draw_grid(ax=None):
 
 def _ibr_model(ss):
     """Return the ANDES model instance that represents the inverter."""
-    for name in ('REGF1', 'REGF2', 'REGCA1'):
+    for name in ('REGF1Lab', 'REGF2Lab', 'REGCA1'):
         m = getattr(ss, name)
         if m.n > 0:
             return m
@@ -452,8 +555,16 @@ def get_results(ss):
     q_sg = ts.y[:, g.Qe.a[0]] * S_BASE
     w_sg = F_NOM * ts.x[:, g.omega.a[0]]
 
-    return dict(t=t, freq=freq, volt=volt, p_ibr=p_ibr, q_ibr=q_ibr,
-                p_sg=p_sg, q_sg=q_sg, f_sg=w_sg)
+    # inverter current magnitude |I| = |S| / V in p.u. on the inverter rating
+    i_ibr = np.hypot(p_ibr, q_ibr) / S_IBR / volt[2]
+
+    # GFM with integral frequency control: power set-point shift P_sec [MW]
+    p_sec = None
+    if hasattr(m, 'Psec_y') and m.KI.v[0] > 0:
+        p_sec = ts.x[:, m.Psec_y.a[0]] * S_BASE
+
+    return dict(t=t, freq=freq, volt=volt, p_ibr=p_ibr, q_ibr=q_ibr, i_ibr=i_ibr,
+                p_sec=p_sec, p_sg=p_sg, q_sg=q_sg, f_sg=w_sg)
 
 
 def plot_results(results, labels=None, buses=(2, 5, 7), title=None):
@@ -483,12 +594,9 @@ def plot_results(results, labels=None, buses=(2, 5, 7), title=None):
         sfx = f' ({lab})' if multi else ''
         ax[1, 0].plot(r['t'], r['p_ibr'], ls, color='C3', label='P inverter' + sfx)
         ax[1, 0].plot(r['t'], r['p_sg'], ls, color='C4', label='P sync. gen.' + sfx)
-        if ss._lab_agc is not None:   # power set-points shifted by the AGC
-            a = ss._lab_agc
-            ax[1, 0].plot(a['t'], r['p_ibr'][0] + a['dp_ibr'], ls, color='C3', lw=0.8,
-                          alpha=0.6, drawstyle='steps-post', label='P set-point inverter (AGC)' + sfx)
-            ax[1, 0].plot(a['t'], r['p_sg'][0] + a['dp_sg'], ls, color='C4', lw=0.8,
-                          alpha=0.6, drawstyle='steps-post', label='P set-point sync. gen. (AGC)' + sfx)
+        if r['p_sec'] is not None:   # set-point shifted by the integral control
+            ax[1, 0].plot(r['t'], r['p_ibr'][0] + r['p_sec'], ls, color='C3', lw=0.8, alpha=0.6,
+                          label='P set-point inverter (P_ref + P_sec)' + sfx)
         ax[1, 1].plot(r['t'], r['q_ibr'], ls, color='C3', label='Q inverter' + sfx)
         ax[1, 1].plot(r['t'], r['q_sg'], ls, color='C4', label='Q sync. gen.' + sfx)
 
@@ -530,6 +638,8 @@ def metrics(ss, bus=5, window=0.5):
                 rocof=rocof[np.argmax(np.abs(rocof))],
                 f_end=f[-1], v_min=r['volt'][bus][after].min(),
                 p_ibr_0=r['p_ibr'][0], p_ibr_end=r['p_ibr'][-1],
+                i_ibr_max=r['i_ibr'][after].max(),
+                p_sec_end=None if r['p_sec'] is None else r['p_sec'][-1],
                 finished=not ss.TDS.busted)
 
 
@@ -541,11 +651,11 @@ def summary(ss, bus=5, label=None):
     print(f'{label:38s} | bus {bus}: f_nadir/peak = {m["f_extreme"]:.3f} Hz '
           f'@ {m["t_extreme"]:.2f} s | RoCoF(500 ms) = {m["rocof"]:+.3f} Hz/s | '
           f'f_end = {m["f_end"]:.3f} Hz | V_min = {m["v_min"]:.3f} pu | '
-          f'P_inv {m["p_ibr_0"]:.0f} -> {m["p_ibr_end"]:.0f} MW{flag}')
-    a = ss._lab_agc
-    if a is not None:
-        print(f'{"":38s} |   AGC: T_sec = {a["T_sec"]:.0f} s, beta = {a["beta"] / F_NOM:.0f} MW/Hz, '
-              f'set-point shift SG {a["dp_sg"][-1]:+.1f} MW, inverter {a["dp_ibr"][-1]:+.1f} MW')
+          f'P_inv {m["p_ibr_0"]:.0f} -> {m["p_ibr_end"]:.0f} MW | '
+          f'I_inv,max = {m["i_ibr_max"]:.2f} pu{flag}')
+    if m['p_sec_end'] is not None:
+        print(f'{"":38s} |   integral frequency control: set-point shift of the inverter '
+              f'P_sec = {m["p_sec_end"]:+.1f} MW')
 
 
 # --------------------------------------------------------------------------
@@ -558,12 +668,16 @@ def make_gui():
     from IPython.display import display, clear_output
 
     style = {'description_width': '190px'}
-    lay = w.Layout(width='470px')
+
+    def lay():
+        # one Layout per widget: visibility is toggled via layout.display,
+        # a shared Layout would hide/show all widgets at once
+        return w.Layout(width='470px')
 
     def fslider(desc, val, lo, hi, step, fmt='.3f'):
         return w.FloatSlider(value=val, min=lo, max=hi, step=step, description=desc,
                              readout_format=fmt, continuous_update=False,
-                             style=style, layout=lay)
+                             style=style, layout=lay())
 
     # --- general settings ---
     control = w.ToggleButtons(options=[('Grid following (GFL)', 'GFL'),
@@ -573,7 +687,7 @@ def make_gui():
                               style={'description_width': '120px',
                                      'button_width': '170px'})
     disturbance = w.Dropdown(options=list(DISTURBANCES), description='Disturbance:',
-                             style=style, layout=lay)
+                             style=style, layout=lay())
     p_ibr = fslider('Inverter dispatch P [MW]', 163, 20, 240, 1, '.0f')
     t_end = fslider('Simulation time [s]', 15, 3, 180, 1, '.0f')
     keep = w.Checkbox(value=False, description='Keep previous runs for comparison')
@@ -605,25 +719,22 @@ def make_gui():
         KIv=fslider('V-ctrl Ki [1/s]', g['KIv'], 1.0, 50.0, 1.0, '.0f'),
         KPi=fslider('I-ctrl Kp', g['KPi'], 0.1, 2.0, 0.05, '.2f'),
         KIi=fslider('I-ctrl Ki [1/s]', g['KIi'], 5.0, 100.0, 1.0, '.0f'),
+        current_limit=w.Checkbox(value=g['current_limit'], description='Current limitation'),
+        Imax=fslider('Current limit Imax [p.u.]', g['Imax'], 0.8, 2.0, 0.05, '.2f'),
+        freq_integral=w.Checkbox(value=g['freq_integral'],
+                                 description='Integral frequency control (restores 50 Hz)'),
+        T_I=fslider('Integral time constant T_I [s]', g['T_I'], 2.0, 120.0, 1.0, '.0f'),
     )
+    gfm['current_limit'].observe(
+        lambda change: setattr(gfm['Imax'], 'disabled', not change['new']), 'value')
 
-    # --- secondary control (AGC) ---
-    g = AGC_DEFAULTS
-    agc = dict(
-        enabled=w.Checkbox(value=g['enabled'], description='Secondary control (AGC)'),
-        T_sec=fslider('AGC time constant T_sec [s]', g['T_sec'], 5.0, 120.0, 1.0, '.0f'),
-        share_sg=fslider('AGC share of sync. gen.', g['share_sg'], 0.0, 1.0, 0.05, '.2f'),
-        dt=fslider('AGC cycle time [s]', g['dt'], 0.1, 4.0, 0.1, '.1f'),
-    )
-
-    def agc_toggled(change):
-        for k in ('T_sec', 'share_sg', 'dt'):
-            agc[k].disabled = not change['new']
+    def integral_toggled(change):
+        gfm['T_I'].disabled = not change['new']
         if change['new'] and t_end.value < 90:
-            t_end.value = 90    # secondary control is slow -> simulate longer
+            t_end.value = 90    # the integral control is slow -> simulate longer
 
-    agc['enabled'].observe(agc_toggled, 'value')
-    agc_toggled({'new': agc['enabled'].value})
+    gfm['freq_integral'].observe(integral_toggled, 'value')
+    integral_toggled({'new': gfm['freq_integral'].value})
 
     gfl_box = w.VBox([w.HTML('<b>Grid-following parameters</b> (REGCA1 / REECA1 / REPCA1)')]
                      + list(gfl.values()))
@@ -652,8 +763,6 @@ def make_gui():
             wid.value = GFL_DEFAULTS[k]
         for k, wid in gfm.items():
             wid.value = GFM_DEFAULTS[k]
-        for k, wid in agc.items():
-            wid.value = AGC_DEFAULTS[k]
 
     def run(_):
         if control.value == 'GFL':
@@ -667,10 +776,9 @@ def make_gui():
             label = f'GFM-{variant} m_p={params["droop"]:.3f}'
             if variant == 'vsm':
                 label += f' H={params["H_vsm"]:.1f}'
+            if params['freq_integral']:
+                label += f' T_I={params["T_I"]:.0f}s'
         label += f', {p_ibr.value:.0f} MW'
-        agc_set = {k: v.value for k, v in agc.items()}
-        if agc_set['enabled']:
-            label += f', AGC T={agc_set["T_sec"]:.0f}s'
 
         status.value = ('<i>Running power flow and RMS simulation ...'
                         + (' (long simulations take up to ~1 min)' if t_end.value > 40 else '')
@@ -678,7 +786,7 @@ def make_gui():
         run_btn.disabled = True
         try:
             ss = run_case(ctrl, params=params, disturbance=disturbance.value,
-                          p_ibr=p_ibr.value / S_BASE, t_end=t_end.value, agc=agc_set)
+                          p_ibr=p_ibr.value / S_BASE, t_end=t_end.value)
         except Exception as exc:  # show the error instead of crashing the GUI
             status.value = f'<b style="color:#c00">Error:</b> {exc}'
             run_btn.disabled = False
@@ -706,8 +814,7 @@ def make_gui():
     reset_btn.on_click(reset)
     refresh_visibility()
 
-    general = w.VBox([w.HTML('<b>Scenario</b>'), disturbance, p_ibr, t_end, keep,
-                      w.HTML('<b>Secondary frequency control</b>')] + list(agc.values()))
+    general = w.VBox([w.HTML('<b>Scenario</b>'), disturbance, p_ibr, t_end, keep])
     panel = w.VBox([control,
                     w.HBox([general, gfl_box, gfm_box]),
                     w.HBox([run_btn, reset_btn, status]),
