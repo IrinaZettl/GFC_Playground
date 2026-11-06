@@ -433,7 +433,7 @@ def build_system(control='GFM', params=None, disturbance='Load step +50 MW (bus 
 
 def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
              p_ibr=1.63, t_end=20.0, t_event=1.0, verbose=False,
-             h_fine=1 / 120, h_coarse=None, t_fine=5.0):
+             h_fine=1 / 120, h_coarse=None, t_fine=5.0, eig=True):
     """
     Build the system, solve the power flow and run the RMS simulation.
 
@@ -441,6 +441,9 @@ def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
     network dynamics), then h_coarse (slow governor / integral control dynamics).
     This keeps long simulations reasonably fast. h_coarse=None picks
     0.1 s for GFM and 1/30 s for GFL (the GFL models converge poorly with larger steps).
+
+    eig=True also computes the eigenvalues (poles) of the linearised system at the
+    initial operating point, see small_signal() and plot_poles().
     """
     if h_coarse is None:
         h_coarse = 1 / 30 if control.upper() == 'GFL' else 0.1
@@ -453,6 +456,20 @@ def run_case(control='GFM', params=None, disturbance='Load step +50 MW (bus 5)',
     ss.TDS.config.no_tqdm = True
     ss._lab_control = control.upper()
     ss._lab_t_event = t_event
+
+    # small-signal analysis at the operating point before the disturbance
+    ss._lab_eig = None
+    if eig:
+        try:
+            ss._lab_eig = small_signal(ss)
+        except Exception as exc:   # never let the analysis block the simulation
+            print(f'Eigenvalue analysis failed: {exc}')
+        finally:
+            if ss.TDS.initialized:
+                # back to the clean initial state; TDS.run() now resumes after t = 0,
+                # so the initial point has to be stored here
+                ss.TDS.reinit()
+                ss.dae.store()
 
     # stage 1: fine time step around the disturbance
     ss.TDS.config.tstep = h_fine
@@ -477,6 +494,226 @@ def _check_initial_current(ss, p):
     if i0 > p['Imax']:
         raise ValueError(f'The initial inverter current ({i0:.2f} p.u.) exceeds the current '
                          f'limit Imax = {p["Imax"]:.2f} p.u. Reduce the dispatch or raise Imax.')
+
+
+# --------------------------------------------------------------------------
+# Small-signal analysis (eigenvalues / pole map)
+# --------------------------------------------------------------------------
+#
+# The DAE system  T dx/dt = f(x, y),  0 = g(x, y)  is linearised at the initial
+# operating point (before the disturbance):
+#
+#     A = T^-1 (f_x - f_y g_y^-1 g_x)
+#
+# The eigenvalues of A are the poles of the system. A pole lambda = sigma + j omega_d
+# describes a mode  e^(sigma t) * cos(omega_d t):  frequency f = omega_d / 2 pi,
+# damping ratio zeta = -sigma / |lambda|.  One pole with sigma > 0 -> unstable.
+#
+# The Jacobians are computed NUMERICALLY (finite differences of the model
+# equations) instead of with the analytic ANDES Jacobians, because the analytic
+# ones miss two couplings of the GFL plant controller REPCA1:
+#   * its error deadbands have zero width and sit exactly at u = 0, where the
+#     analytic derivative is 0 (the loop would look open),
+#   * the voltage error reaches the PI controller through a "VarHold" service,
+#     which is not a variable and therefore not part of the analytic Jacobian.
+
+# |Re| below this counts as zero (numerical Jacobian), e.g. the rotor-angle reference mode
+EIG_TOL = 1e-3
+_UNIT_OF_MODEL = {'GENROU': 'G1', 'IEEEX1': 'G1', 'TGOV1': 'G1'}   # everything else: inverter
+
+
+def _state_owners(ss):
+    """(model class, device idx) for every state of the DAE (by address)."""
+    owners = [None] * ss.dae.n
+    for mdl in ss.exist.tds.values():
+        for var in mdl.states.values():
+            for i, a in enumerate(var.a):
+                owners[a] = (mdl.class_name, mdl.idx.v[i])
+    return owners
+
+
+def _numerical_jacobian(ss, eps=1e-6):
+    """Jacobian of [f; g] w.r.t. [x; y] by forward differences (dense)."""
+    from kvxopt import spmatrix
+
+    dae = ss.dae
+    n, m = dae.n, dae.m
+    xy0 = np.concatenate([dae.x, dae.y])
+    jac = np.zeros((n + m, n + m))
+    try:
+        fg0 = ss.TDS._fg_wrapper(xy0).copy()
+        for k in range(n + m):
+            xy = xy0.copy()
+            xy[k] += eps
+            jac[:, k] = (ss.TDS._fg_wrapper(xy) - fg0) / eps
+    finally:
+        ss.TDS._fg_wrapper(xy0)   # restore the operating point (and all flags)
+
+    def sparse(a, tol=1e-9):
+        i, j = np.nonzero(np.abs(a) > tol)
+        return spmatrix(a[i, j].tolist(), i.tolist(), j.tolist(), a.shape, 'd')
+
+    return (sparse(jac[:n, :n]), sparse(jac[:n, n:]),
+            sparse(jac[n:, :n]), sparse(jac[n:, n:]))
+
+
+def small_signal(ss):
+    """
+    Eigenvalue analysis at the initial operating point (needs a solved power flow).
+
+    Returns a dict with
+        mu     : eigenvalues (poles) [1/s]
+        names  : name of the state variable that participates most in each mode
+        share  : participation of 'G1' and 'inverter' in each mode (0 ... 1)
+        n_zero : number of eigenvalues at the origin (rotor-angle reference)
+    """
+    if not ss.TDS.initialized:
+        ss.TDS.init()
+    dae, eig = ss.dae, ss.EIG
+    owners = _state_owners(ss)
+    dae.fx, dae.fy, dae.gx, dae.gy = _numerical_jacobian(ss)
+    A = np.array(eig.calc_As())
+    states = [owners[list(dae.x_name).index(nm)] for nm in eig.x_name]
+    names = np.array([f'{nm.split()[0]} ({own[0]})' for nm, own in zip(eig.x_name, states)])
+
+    # Remove states that do not influence the dynamics:
+    #  * frequency measurements that only exist for plotting (BusFreq_1 ... BusFreq_9),
+    #  * states with a zero row in A (switched-off integrators, e.g. P_sec with K_I = 0).
+    # Both only add their own, decoupled eigenvalue (at -1/T_f or exactly 0).
+    keep = np.array([not (own[0] == 'BusFreq' and own[1] != 'BusFreq_IBR') for own in states])
+    keep &= np.abs(A).max(axis=1) > 1e-7
+    A, names = A[np.ix_(keep, keep)], names[keep]
+    unit = np.array([_UNIT_OF_MODEL.get(own[0], 'inverter')
+                     for own, k in zip(states, keep) if k])
+
+    # participation factors p[k, i] = |right eigenvector| * |left eigenvector|,
+    # normalised so that the participations of all states in mode i add up to 1
+    mu, right = np.linalg.eig(A)
+    left = np.linalg.pinv(right).T     # pinv: the eigenvectors can be nearly dependent
+    pf = np.abs(right) * np.abs(left)
+    pf /= pf.sum(axis=0, keepdims=True)
+    dominant = names[np.argmax(pf, axis=0)]
+    share = {u: pf[unit == u].sum(axis=0) for u in ('G1', 'inverter')}
+    return dict(mu=mu, names=dominant, share=share,
+                n_zero=int(np.sum(np.abs(mu) < EIG_TOL)))
+
+
+def oscillatory_modes(ss, n=3, f_min=0.02):
+    """The n least damped oscillatory modes (f > f_min Hz) as a list of dicts."""
+    e = ss._lab_eig
+    if e is None:
+        return []
+    mu = e['mu']
+    idx = [i for i in range(len(mu)) if mu[i].imag / (2 * np.pi) > f_min]
+    idx = sorted(idx, key=lambda i: -mu[i].real / abs(mu[i]))[:n]   # lowest damping first
+    return [dict(pole=mu[i], f=mu[i].imag / (2 * np.pi), zeta=-mu[i].real / abs(mu[i]),
+                 state=e['names'][i], share_g1=e['share']['G1'][i],
+                 share_inv=e['share']['inverter'][i]) for i in idx]
+
+
+def plot_poles(results, labels=None, zoom_re=-12.0, title=None):
+    """
+    Pole map (eigenvalues of the linearised system at the initial operating point).
+
+    Left: all poles. Right: zoom on the slow, electromechanical range (Re > zoom_re)
+    with lines of constant damping ratio and a frequency axis in Hz.
+    """
+    if not isinstance(results, (list, tuple)):
+        results = [results]
+    if labels is None:
+        labels = [r._lab_control for r in results]
+    runs = [(r._lab_eig, lab) for r, lab in zip(results, labels)
+            if getattr(r, '_lab_eig', None) is not None]
+    if not runs:
+        print('No eigenvalues available.')
+        return
+
+    fig, (ax_all, ax_z) = plt.subplots(1, 2, figsize=(13, 5.2),
+                                       gridspec_kw=dict(width_ratios=[1, 1.25]))
+    markers = ['x', '+', '1', '4']
+
+    for k, (e, lab) in enumerate(runs):
+        mu = e['mu']
+        kw = dict(marker=markers[k % len(markers)], color=f'C{k}', ls='none',
+                  ms=8, mew=1.6, label=lab)
+        ax_all.plot(mu.real, mu.imag, **kw)
+        ax_z.plot(mu.real, mu.imag, **kw)
+        unstable = mu[mu.real > EIG_TOL]
+        for ax in (ax_all, ax_z):
+            ax.plot(unstable.real, unstable.imag, 'o', ms=14, mfc='none', mec='#c00', mew=1.5)
+
+    # zoom window: all poles right of zoom_re
+    mu_all = np.concatenate([e['mu'] for e, _ in runs])
+    sel = mu_all[mu_all.real >= zoom_re]
+    re_hi = max(1.5, 1.25 * sel.real.max() + 0.5) if len(sel) else 1.5
+    im_hi = max(10.0, 1.15 * np.abs(sel.imag).max()) if len(sel) else 10.0
+    ax_z.set_xlim(zoom_re, re_hi)
+    ax_z.set_ylim(-im_hi, im_hi)
+    ax_all.add_patch(plt.Rectangle((zoom_re, -im_hi), re_hi - zoom_re, 2 * im_hi,
+                                   fill=False, ls='--', ec='0.4', lw=1))
+
+    # lines of constant damping ratio:  Im = +-Re * sqrt(1 - zeta^2) / zeta
+    for k, zeta in enumerate((0.05, 0.10, 0.20)):
+        slope = np.sqrt(1 - zeta ** 2) / zeta
+        re = np.array([0.0, zoom_re])
+        for s in (1, -1):
+            ax_z.plot(re, -s * re * slope, ':', color='0.5', lw=1)
+        # label in the lower half plane, staggered in height so the labels do not overlap
+        y_lab = -im_hi * (0.95 - 0.1 * k)
+        at_left_edge = y_lab / slope < 0.9 * zoom_re
+        x_lab = 0.9 * zoom_re if at_left_edge else y_lab / slope
+        ax_z.text(x_lab, x_lab * slope, f' ζ={zeta:.0%} ', fontsize=8, color='0.4',
+                  ha='left' if at_left_edge else 'right', va='center')
+
+    # annotate frequency and damping of the oscillatory modes (single run only)
+    if len(runs) == 1:
+        mu = runs[0][0]['mu']
+        zeta = -mu.real / np.abs(mu + 1e-12)
+        for lam in mu[(mu.imag > 0.05) & (mu.real >= zoom_re) & (zeta < 0.7)]:
+            ax_z.annotate(f'{lam.imag / 2 / np.pi:.2f} Hz, ζ={-lam.real / abs(lam):.0%}',
+                          (lam.real, lam.imag), xytext=(6, 4), textcoords='offset points',
+                          fontsize=8)
+
+    lo, hi = ax_all.get_xlim()
+    ax_all.set_xlim(lo, max(hi, re_hi, 0.08 * (hi - lo)))
+    for ax in (ax_all, ax_z):
+        ax.axhline(0, color='k', lw=0.8)
+        ax.axvline(0, color='k', lw=0.8)
+        xlim = ax.get_xlim()
+        ax.axvspan(0, xlim[1], color='#c00', alpha=0.06, lw=0)   # unstable half plane
+        ax.set_xlim(xlim)
+        ax.grid(alpha=0.3)
+        ax.set_xlabel('Real part σ [1/s]')
+    ax_all.set_ylabel('Imaginary part ω [rad/s]')
+    ax_all.set_title('All poles')
+    ax_z.set_title('Zoom: slow / electromechanical modes')
+    sec = ax_z.secondary_yaxis('right', functions=(lambda w_: w_ / (2 * np.pi),
+                                                   lambda f_: f_ * 2 * np.pi))
+    sec.set_ylabel('Frequency f [Hz]')
+    ax_z.legend(fontsize=8, loc='upper left')
+    fig.suptitle(title or 'Pole map (eigenvalues at the initial operating point)')
+    fig.tight_layout()
+    plt.show()
+
+
+def pole_summary(ss, label=None, n=3):
+    """Print the stability verdict and the least damped oscillatory modes."""
+    e = getattr(ss, '_lab_eig', None)
+    label = label or ss._lab_control
+    if e is None:
+        print(f'{label:38s} | no eigenvalues available')
+        return
+    mu = e['mu']
+    n_unst = int(np.sum(mu.real > EIG_TOL))
+    verdict = ('small-signal STABLE' if n_unst == 0
+               else f'UNSTABLE: {n_unst} pole(s) in the right half plane')
+    print(f'{label:38s} | {len(mu)} poles, max Re = {mu.real.max():+.3f} 1/s -> {verdict}'
+          + (f' ({e["n_zero"]} pole at 0: rotor-angle reference)' if e['n_zero'] else ''))
+    for m in oscillatory_modes(ss, n):
+        print(f'{"":38s} |   {m["pole"].real:+8.2f} ± j{m["pole"].imag:6.2f}  '
+              f'f = {m["f"]:5.2f} Hz  ζ = {m["zeta"]:6.1%}  '
+              f'(G1 {m["share_g1"]:.0%} / inverter {m["share_inv"]:.0%}, '
+              f'dominant state: {m["state"]})')
 
 
 # --------------------------------------------------------------------------
@@ -691,6 +928,7 @@ def make_gui():
     p_ibr = fslider('Inverter dispatch P [MW]', 163, 20, 240, 1, '.0f')
     t_end = fslider('Simulation time [s]', 15, 3, 180, 1, '.0f')
     keep = w.Checkbox(value=False, description='Keep previous runs for comparison')
+    show_poles = w.Checkbox(value=True, description='Show pole map (eigenvalues)')
 
     # --- GFL parameters ---
     g = GFL_DEFAULTS
@@ -786,7 +1024,8 @@ def make_gui():
         run_btn.disabled = True
         try:
             ss = run_case(ctrl, params=params, disturbance=disturbance.value,
-                          p_ibr=p_ibr.value / S_BASE, t_end=t_end.value)
+                          p_ibr=p_ibr.value / S_BASE, t_end=t_end.value,
+                          eig=show_poles.value)
         except Exception as exc:  # show the error instead of crashing the GUI
             status.value = f'<b style="color:#c00">Error:</b> {exc}'
             run_btn.disabled = False
@@ -808,13 +1047,17 @@ def make_gui():
                          title=disturbance.value)
             for s, lab in history:
                 summary(s, label=lab)
+            if show_poles.value:
+                plot_poles([h[0] for h in history], [h[1] for h in history])
+                for s, lab in history:
+                    pole_summary(s, label=lab)
 
     control.observe(refresh_visibility, 'value')
     run_btn.on_click(run)
     reset_btn.on_click(reset)
     refresh_visibility()
 
-    general = w.VBox([w.HTML('<b>Scenario</b>'), disturbance, p_ibr, t_end, keep])
+    general = w.VBox([w.HTML('<b>Scenario</b>'), disturbance, p_ibr, t_end, keep, show_poles])
     panel = w.VBox([control,
                     w.HBox([general, gfl_box, gfm_box]),
                     w.HBox([run_btn, reset_btn, status]),
